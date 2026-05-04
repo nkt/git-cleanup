@@ -1,0 +1,27 @@
+[package]
+name = "git-cleanup"
+version = "0.1.0"
+edition = "2021"
+description = "Prune merged, squashed, and gone branches from a git repository"
+license = "MIT"
+repository = "https://github.com/nkt/git-cleanup"
+
+[[bin]]
+name = "git-cleanup"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+dialoguer = { version = "0.12", default-features = false }
+git2 = { version = "0.20", default-features = false }
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+[build-dependencies]
+clap = { version = "4.6", features = ["derive"] }
+clap_mangen = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
