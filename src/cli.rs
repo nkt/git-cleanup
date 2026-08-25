@@ -19,6 +19,32 @@ pub struct Args {
     #[arg(long)]
     pub no_gone: bool,
 
+    /// Also detect abandoned branches (tip older than --abandoned-days).
+    /// Off by default: these may hold unmerged work
+    #[arg(long)]
+    pub abandoned: bool,
+
+    /// Age threshold in days for the abandoned category
+    #[arg(long, value_name = "DAYS", default_value_t = 90)]
+    pub abandoned_days: u32,
+
+    /// Read-only scan: print candidates and exit 0, never prompt or delete
+    #[arg(long, conflicts_with_all = ["force", "yes"])]
+    pub list: bool,
+
+    /// Machine-readable JSON output (implies --list)
+    #[arg(long, conflicts_with_all = ["force", "yes"])]
+    pub json: bool,
+
+    /// Delete the named branches (no scan, no prompt) and exit
+    #[arg(
+        long,
+        value_name = "BRANCH",
+        num_args = 1..,
+        conflicts_with_all = ["list", "json", "force", "yes"]
+    )]
+    pub delete: Vec<String>,
+
     /// Don't run `git fetch --prune` before scanning
     #[arg(long)]
     pub no_fetch: bool,
@@ -42,4 +68,8 @@ pub struct Args {
     /// Per-branch reasoning
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Print structured timing + diagnostic logs to stderr
+    #[arg(long)]
+    pub debug: bool,
 }

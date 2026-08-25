@@ -4,12 +4,12 @@ use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 
-pub fn print_summary(candidates: &[Candidate], main: &str, dry_run: bool) {
-    if dry_run {
+pub fn print_summary(candidates: &[Candidate], main: &str, read_only: bool) {
+    if read_only {
         println!(
             "{} {} (main: {})\n",
             "git-cleanup".bold(),
-            "— dry run".dimmed(),
+            "— read-only scan".dimmed(),
             main.cyan()
         );
     } else {
@@ -23,7 +23,12 @@ pub fn print_summary(candidates: &[Candidate], main: &str, dry_run: bool) {
 
     let name_width = candidates.iter().map(|c| c.name.len()).max().unwrap_or(0);
 
-    for cat in [Category::Merged, Category::Squashed, Category::Gone] {
+    for cat in [
+        Category::Merged,
+        Category::Squashed,
+        Category::Gone,
+        Category::Abandoned,
+    ] {
         let group: Vec<&Candidate> =
             candidates.iter().filter(|c| c.category == cat).collect();
         if group.is_empty() {
@@ -34,14 +39,19 @@ pub fn print_summary(candidates: &[Candidate], main: &str, dry_run: bool) {
             Category::Merged => header.green().to_string(),
             Category::Squashed => header.yellow().to_string(),
             Category::Gone => header.red().to_string(),
+            Category::Abandoned => header.magenta().to_string(),
         };
         println!("  {colored_header}");
         for c in group {
+            let detail = match &c.worktree {
+                Some(path) => format!("{} — in worktree {path}", c.detail),
+                None => c.detail.clone(),
+            };
             println!(
                 "    {} {:<width$}  {}",
                 "•".dimmed(),
                 c.name,
-                c.detail.dimmed(),
+                detail.dimmed(),
                 width = name_width
             );
         }
@@ -49,15 +59,35 @@ pub fn print_summary(candidates: &[Candidate], main: &str, dry_run: bool) {
     }
 
     println!(
-        "{} {} {}",
+        "{} stale {} {}",
         candidates.len().bold(),
         if candidates.len() == 1 {
             "branch"
         } else {
             "branches"
         },
-        "will be deleted.".dimmed()
+        "found.".dimmed()
     );
+}
+
+pub fn print_json(candidates: &[Candidate], main: &str) {
+    let arr: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "category": c.category.label(),
+                "detail": c.detail,
+                "tip": c.tip.to_string(),
+                "age_days": c.age_days,
+                "ahead": c.ahead,
+                "upstream": c.upstream.label(),
+                "worktree": c.worktree,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({ "main": main, "candidates": arr });
+    println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
 }
 
 pub fn select(candidates: &[Candidate]) -> Result<Vec<usize>> {
