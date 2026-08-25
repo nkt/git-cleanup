@@ -1,10 +1,15 @@
-use crate::git::{Candidate, Category};
+use crate::git::{Candidate, Category, WorktreeCandidate};
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 
-pub fn print_summary(candidates: &[Candidate], main: &str, read_only: bool) {
+pub fn print_summary(
+    candidates: &[Candidate],
+    worktrees: &[WorktreeCandidate],
+    main: &str,
+    read_only: bool,
+) {
     if read_only {
         println!(
             "{} {} (main: {})\n",
@@ -16,7 +21,7 @@ pub fn print_summary(candidates: &[Candidate], main: &str, read_only: bool) {
         println!("{} (main: {})\n", "git-cleanup".bold(), main.cyan());
     }
 
-    if candidates.is_empty() {
+    if candidates.is_empty() && worktrees.is_empty() {
         println!("  {}", "nothing to clean up.".green());
         return;
     }
@@ -58,19 +63,37 @@ pub fn print_summary(candidates: &[Candidate], main: &str, read_only: bool) {
         println!();
     }
 
-    println!(
-        "{} stale {} {}",
-        candidates.len().bold(),
-        if candidates.len() == 1 {
-            "branch"
-        } else {
-            "branches"
-        },
-        "found.".dimmed()
-    );
+    if !worktrees.is_empty() {
+        println!("  {}", format!("worktrees ({})", worktrees.len()).blue());
+        for wt in worktrees {
+            let note = match &wt.blocked {
+                Some(reason) => format!("{} — skipped: {reason}", wt.detail),
+                None => wt.detail.clone(),
+            };
+            println!("    {} {}  {}", "•".dimmed(), wt.path, note.dimmed());
+        }
+        println!();
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !candidates.is_empty() {
+        parts.push(format!(
+            "{} stale {}",
+            candidates.len(),
+            if candidates.len() == 1 { "branch" } else { "branches" }
+        ));
+    }
+    if !worktrees.is_empty() {
+        parts.push(format!(
+            "{} stale {}",
+            worktrees.len(),
+            if worktrees.len() == 1 { "worktree" } else { "worktrees" }
+        ));
+    }
+    println!("{} {}", parts.join(" and ").bold(), "found.".dimmed());
 }
 
-pub fn print_json(candidates: &[Candidate], main: &str) {
+pub fn print_json(candidates: &[Candidate], worktrees: &[WorktreeCandidate], main: &str) {
     let arr: Vec<serde_json::Value> = candidates
         .iter()
         .map(|c| {
@@ -86,11 +109,28 @@ pub fn print_json(candidates: &[Candidate], main: &str) {
             })
         })
         .collect();
-    let out = serde_json::json!({ "main": main, "candidates": arr });
+    let wt_arr: Vec<serde_json::Value> = worktrees
+        .iter()
+        .map(|wt| {
+            serde_json::json!({
+                "path": wt.path,
+                "branch": wt.branch,
+                "category": wt.category.map(|c| c.label()),
+                "detail": wt.detail,
+                "prunable": wt.prunable,
+                "blocked": wt.blocked,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "main": main,
+        "candidates": arr,
+        "worktrees": wt_arr,
+    });
     println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
 }
 
-pub fn select(candidates: &[Candidate]) -> Result<Vec<usize>> {
+pub fn select(candidates: &[&Candidate]) -> Result<Vec<usize>> {
     let theme = ColorfulTheme::default();
     let items: Vec<String> = candidates
         .iter()
@@ -107,14 +147,44 @@ pub fn select(candidates: &[Candidate]) -> Result<Vec<usize>> {
     Ok(chosen)
 }
 
-pub fn confirm_delete(count: usize) -> Result<bool> {
+pub fn select_worktrees(worktrees: &[&WorktreeCandidate]) -> Result<Vec<usize>> {
     let theme = ColorfulTheme::default();
-    let prompt = format!(
-        "Delete {count} {}?",
-        if count == 1 { "branch" } else { "branches" }
-    );
+    let items: Vec<String> = worktrees
+        .iter()
+        .map(|wt| format!("{} — {}", wt.path, wt.detail))
+        .collect();
+    let defaults: Vec<bool> = vec![true; worktrees.len()];
+
+    let chosen = MultiSelect::with_theme(&theme)
+        .with_prompt("Select worktrees to remove (space toggles, enter confirms)")
+        .items(&items)
+        .defaults(&defaults)
+        .interact()?;
+
+    Ok(chosen)
+}
+
+pub fn confirm_cleanup(branches: usize, worktrees: usize) -> Result<bool> {
+    let theme = ColorfulTheme::default();
+    let mut parts: Vec<String> = Vec::new();
+    if branches > 0 {
+        parts.push(format!(
+            "delete {branches} {}",
+            if branches == 1 { "branch" } else { "branches" }
+        ));
+    }
+    if worktrees > 0 {
+        parts.push(format!(
+            "remove {worktrees} {}",
+            if worktrees == 1 { "worktree" } else { "worktrees" }
+        ));
+    }
+    let mut prompt = parts.join(" and ");
+    if let Some(first) = prompt.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
     Ok(Confirm::with_theme(&theme)
-        .with_prompt(prompt)
+        .with_prompt(format!("{prompt}?"))
         .default(false)
         .interact()?)
 }

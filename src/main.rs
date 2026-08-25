@@ -45,18 +45,26 @@ fn run() -> Result<ExitCode> {
     let repo = git::open()?;
     dbg_log!("repo discovered at {:?} ({:?})", repo.path(), t.elapsed());
 
-    if !args.delete.is_empty() {
-        let main_name = git::detect_main(&repo, &args.remote, args.main.as_deref())?;
+    if !args.delete.is_empty() || !args.remove_worktree.is_empty() {
         let mut results: Vec<(String, Option<String>)> = Vec::new();
-        let mut to_delete: Vec<String> = Vec::new();
-        for name in &args.delete {
-            if name == &main_name || git::PROTECTED.contains(&name.as_str()) {
-                results.push((name.clone(), Some("protected branch".into())));
-            } else {
-                to_delete.push(name.clone());
-            }
+        // Worktrees first: a branch checked out in a removed worktree
+        // becomes deletable in the same run.
+        for path in &args.remove_worktree {
+            results.push(git::remove_worktree_path(path));
         }
-        results.extend(git::delete_branches(&repo, &to_delete));
+        if !args.delete.is_empty() {
+            let main_name =
+                git::detect_main(&repo, &args.remote, args.main.as_deref())?;
+            let mut to_delete: Vec<String> = Vec::new();
+            for name in &args.delete {
+                if name == &main_name || git::PROTECTED.contains(&name.as_str()) {
+                    results.push((name.clone(), Some("protected branch".into())));
+                } else {
+                    to_delete.push(name.clone());
+                }
+            }
+            results.extend(git::delete_branches(&repo, &to_delete));
+        }
         ui::report_deletions(&results);
         let any_failed = results.iter().any(|(_, err)| err.is_some());
         return Ok(if any_failed {
@@ -105,55 +113,92 @@ fn run() -> Result<ExitCode> {
         t.elapsed()
     );
 
+    let worktree_cands = git::scan_worktrees(&candidates);
+
     if args.json {
-        ui::print_json(&candidates, &main_name);
+        ui::print_json(&candidates, &worktree_cands, &main_name);
         return Ok(ExitCode::SUCCESS);
     }
-    ui::print_summary(&candidates, &main_name, read_only);
-    if read_only || candidates.is_empty() {
+    ui::print_summary(&candidates, &worktree_cands, &main_name, read_only);
+    if read_only || (candidates.is_empty() && worktree_cands.is_empty()) {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let to_delete: Vec<String> = if args.force {
-        candidates.iter().map(|c| c.name.clone()).collect()
-    } else if args.yes {
-        if !ui::confirm_delete(candidates.len())? {
-            println!("{}", "aborted.".dimmed());
-            return Ok(ExitCode::SUCCESS);
-        }
-        candidates.iter().map(|c| c.name.clone()).collect()
-    } else {
-        if !ui::is_interactive() {
-            eprintln!(
-                "\n{}: not running on a TTY. Use {} for a read-only scan ({} for machine output), {} to delete all, or {} to skip the picker.",
-                "note".yellow(),
-                "--list".bold(),
-                "--json".bold(),
-                "--force".bold(),
-                "--yes".bold()
-            );
-            return Ok(ExitCode::from(1));
-        }
-        println!();
-        let picked = ui::select(&candidates)?;
-        if picked.is_empty() {
-            println!("{}", "nothing selected.".dimmed());
-            return Ok(ExitCode::SUCCESS);
-        }
-        let chosen: Vec<String> =
-            picked.iter().map(|&i| candidates[i].name.clone()).collect();
-        if !ui::confirm_delete(chosen.len())? {
-            println!("{}", "aborted.".dimmed());
-            return Ok(ExitCode::SUCCESS);
-        }
-        chosen
-    };
+    // Branches checked out in a worktree are handled through their worktree;
+    // blocked worktrees (dirty, locked, current dir) are shown but kept.
+    let free: Vec<&git::Candidate> =
+        candidates.iter().filter(|c| c.worktree.is_none()).collect();
+    let removable: Vec<&git::WorktreeCandidate> = worktree_cands
+        .iter()
+        .filter(|w| w.blocked.is_none())
+        .collect();
+
+    let (to_delete, wt_selected): (Vec<String>, Vec<&git::WorktreeCandidate>) =
+        if args.force {
+            (
+                free.iter().map(|c| c.name.clone()).collect(),
+                removable.clone(),
+            )
+        } else if args.yes {
+            if !ui::confirm_cleanup(free.len(), removable.len())? {
+                println!("{}", "aborted.".dimmed());
+                return Ok(ExitCode::SUCCESS);
+            }
+            (
+                free.iter().map(|c| c.name.clone()).collect(),
+                removable.clone(),
+            )
+        } else {
+            if !ui::is_interactive() {
+                eprintln!(
+                    "\n{}: not running on a TTY. Use {} for a read-only scan ({} for machine output), {} to delete all, or {} to skip the picker.",
+                    "note".yellow(),
+                    "--list".bold(),
+                    "--json".bold(),
+                    "--force".bold(),
+                    "--yes".bold()
+                );
+                return Ok(ExitCode::from(1));
+            }
+            println!();
+            let chosen: Vec<String> = if free.is_empty() {
+                Vec::new()
+            } else {
+                ui::select(&free)?
+                    .into_iter()
+                    .map(|i| free[i].name.clone())
+                    .collect()
+            };
+            let wt_chosen: Vec<&git::WorktreeCandidate> = if removable.is_empty() {
+                Vec::new()
+            } else {
+                ui::select_worktrees(&removable)?
+                    .into_iter()
+                    .map(|i| removable[i])
+                    .collect()
+            };
+            if chosen.is_empty() && wt_chosen.is_empty() {
+                println!("{}", "nothing selected.".dimmed());
+                return Ok(ExitCode::SUCCESS);
+            }
+            if !ui::confirm_cleanup(chosen.len(), wt_chosen.len())? {
+                println!("{}", "aborted.".dimmed());
+                return Ok(ExitCode::SUCCESS);
+            }
+            (chosen, wt_chosen)
+        };
+
+    if to_delete.is_empty() && wt_selected.is_empty() {
+        println!("{}", "nothing deletable (all candidates are blocked).".dimmed());
+        return Ok(ExitCode::SUCCESS);
+    }
 
     println!();
     let t = Instant::now();
-    let results = git::delete_branches(&repo, &to_delete);
+    let mut results = git::delete_branches(&repo, &to_delete);
+    results.extend(git::remove_worktrees(&repo, &wt_selected));
     dbg_log!(
-        "delete_branches: {} attempted, {} failed, {:?}",
+        "cleanup: {} attempted, {} failed, {:?}",
         results.len(),
         results.iter().filter(|(_, e)| e.is_some()).count(),
         t.elapsed()

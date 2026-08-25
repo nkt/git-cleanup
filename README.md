@@ -1,6 +1,7 @@
 # git-cleanup
 
-Prune merged, squashed, and gone branches from a git repository.
+Prune merged, squashed, and gone branches — and the stale worktrees
+holding them — from a git repository.
 
 ## Install
 
@@ -37,6 +38,8 @@ prompt for which to delete.
 | `--list` | read-only scan: print candidates and exit, never prompt or delete |
 | `--json` | machine-readable output (implies `--list`) |
 | `--delete <BRANCH>...` | delete the named branches directly, no scan or prompt |
+| `--remove-worktree <PATH>...` | remove the named worktrees directly (combines with `--delete`) |
+| `--squash-scan-limit <COMMITS>` | cap on main-history commits scanned for squash matches (default 10000, 0 = no cap) |
 | `--no-fetch` | don't run `git fetch --prune` first |
 | `-f`, `--force` | delete every candidate without prompting |
 | `-y`, `--yes` | accept the full list (skip the picker, still confirms) |
@@ -46,8 +49,14 @@ prompt for which to delete.
 | `--debug` | structured timing + diagnostic logs on stderr |
 
 The currently checked-out branch, the resolved main branch, and
-`main`/`master`/`develop`/`trunk` are always protected. Branches checked
-out in a worktree are reported but never deleted.
+`main`/`master`/`develop`/`trunk` are always protected.
+
+## Worktrees
+
+The scan also covers linked worktrees: prunable ones (directory gone)
+and worktrees whose checked-out branch is itself a candidate. Removing
+such a worktree also deletes its freed branch. Worktrees that are dirty,
+locked, or contain the current directory are shown but never removed.
 
 ## How it decides
 
@@ -87,6 +96,11 @@ Main is detected from `refs/remotes/<remote>/HEAD`, falling back to
 `ahead` is the number of commits not reachable from main: `0` means safe
 by ancestry, `null` means not computed (`squashed` is already proven by
 patch-id equivalence). `upstream` is `tracked`, `gone`, or `none`.
+
+A `worktrees` array sits next to `candidates`, one object per stale
+worktree: `path`, `branch`, `category` (the branch's category, `null`
+for a plain prunable entry), `detail`, `prunable`, and `blocked` (`null`
+when removable, otherwise the reason it is kept).
 
 Exit codes: `0` success (including a clean `--list`), `1` some deletions
 failed or interactive mode was blocked by a missing TTY, `2` fatal error.

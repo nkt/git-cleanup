@@ -764,31 +764,217 @@ fn delete_one(repo: &Repository, name: &str) -> std::result::Result<(), git2::Er
     Ok(())
 }
 
-fn list_worktree_branches() -> HashMap<String, String> {
-    let mut map = HashMap::new();
+#[derive(Debug, Clone)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+    pub locked: bool,
+    pub prunable: bool,
+    pub is_main: bool,
+}
+
+fn list_worktrees() -> Vec<WorktreeInfo> {
     let out = match Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .output()
     {
-        Ok(o) => o,
-        Err(_) => return map,
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
     };
-    if !out.status.success() {
-        return map;
-    }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut cur_path: Option<String> = None;
+    let mut result: Vec<WorktreeInfo> = Vec::new();
+    let mut cur: Option<WorktreeInfo> = None;
     for line in text.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            cur_path = Some(p.to_string());
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            let b = b.strip_prefix("refs/heads/").unwrap_or(b);
-            if let Some(p) = &cur_path {
-                map.insert(b.to_string(), p.clone());
+            if let Some(wt) = cur.take() {
+                result.push(wt);
             }
-        } else if line.is_empty() {
-            cur_path = None;
+            cur = Some(WorktreeInfo {
+                path: p.to_string(),
+                branch: None,
+                locked: false,
+                prunable: false,
+                is_main: result.is_empty(),
+            });
+        } else if let Some(wt) = cur.as_mut() {
+            if let Some(b) = line.strip_prefix("branch ") {
+                wt.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+            } else if line == "locked" || line.starts_with("locked ") {
+                wt.locked = true;
+            } else if line == "prunable" || line.starts_with("prunable ") {
+                wt.prunable = true;
+            }
         }
     }
-    map
+    if let Some(wt) = cur.take() {
+        result.push(wt);
+    }
+    result
+}
+
+fn list_worktree_branches() -> HashMap<String, String> {
+    list_worktrees()
+        .into_iter()
+        .filter(|wt| !wt.is_main)
+        .filter_map(|wt| wt.branch.map(|b| (b, wt.path)))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct WorktreeCandidate {
+    pub path: String,
+    pub branch: Option<String>,
+    /// None means prunable (the directory is gone), not tied to a branch category.
+    pub category: Option<Category>,
+    pub detail: String,
+    /// Reason this worktree is listed but not removable (dirty, locked, ...).
+    pub blocked: Option<String>,
+    pub prunable: bool,
+}
+
+/// Find stale worktrees: prunable ones plus worktrees whose checked-out
+/// branch is itself a deletion candidate.
+pub fn scan_worktrees(candidates: &[Candidate]) -> Vec<WorktreeCandidate> {
+    let by_branch: HashMap<&str, &Candidate> =
+        candidates.iter().map(|c| (c.name.as_str(), c)).collect();
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok());
+
+    let mut result = Vec::new();
+    for wt in list_worktrees() {
+        if wt.is_main {
+            continue;
+        }
+
+        if wt.prunable {
+            dbg_log!("worktree {}: prunable", wt.path);
+            // If the checked-out branch is itself a candidate, pruning
+            // frees it for deletion too.
+            let category = wt
+                .branch
+                .as_deref()
+                .and_then(|b| by_branch.get(b))
+                .map(|c| c.category);
+            result.push(WorktreeCandidate {
+                path: wt.path,
+                branch: wt.branch,
+                category,
+                detail: "prunable (directory is gone)".to_string(),
+                blocked: wt.locked.then(|| "locked".to_string()),
+                prunable: true,
+            });
+            continue;
+        }
+
+        let Some(cand) = wt.branch.as_deref().and_then(|b| by_branch.get(b)) else {
+            dbg_log!("worktree {}: branch not a candidate, kept", wt.path);
+            continue;
+        };
+
+        let blocked = if wt.locked {
+            Some("locked".to_string())
+        } else if cwd
+            .as_ref()
+            .zip(std::path::Path::new(&wt.path).canonicalize().ok())
+            .is_some_and(|(c, w)| c.starts_with(w))
+        {
+            Some("current directory".to_string())
+        } else if worktree_is_dirty(&wt.path) {
+            Some("uncommitted changes".to_string())
+        } else {
+            None
+        };
+        dbg_log!(
+            "worktree {}: branch {} is {} (blocked: {:?})",
+            wt.path,
+            cand.name,
+            cand.category.label(),
+            blocked
+        );
+        result.push(WorktreeCandidate {
+            path: wt.path,
+            branch: wt.branch,
+            category: Some(cand.category),
+            detail: format!("branch {}: {}", cand.name, cand.detail),
+            blocked,
+            prunable: false,
+        });
+    }
+    result
+}
+
+fn worktree_is_dirty(path: &str) -> bool {
+    match Command::new("git")
+        .args(["-C", path, "status", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => !o.stdout.is_empty(),
+        // If status can't run, err on the side of caution.
+        _ => true,
+    }
+}
+
+/// Remove one worktree via `git worktree remove` (no --force: git itself
+/// refuses dirty or locked worktrees as a second line of defense).
+pub fn remove_worktree_path(path: &str) -> (String, Option<String>) {
+    let out = Command::new("git")
+        .args(["worktree", "remove", path])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => (format!("worktree {path}"), None),
+        Ok(o) => {
+            let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let msg = if msg.is_empty() { "git worktree remove failed".to_string() } else { msg };
+            (format!("worktree {path}"), Some(msg))
+        }
+        Err(e) => (format!("worktree {path}"), Some(e.to_string())),
+    }
+}
+
+/// Remove the selected worktrees; prunable ones go through
+/// `git worktree prune`, live ones through `git worktree remove` followed
+/// by deleting their (now free) branch.
+pub fn remove_worktrees(
+    repo: &Repository,
+    selected: &[&WorktreeCandidate],
+) -> Vec<(String, Option<String>)> {
+    let mut results = Vec::new();
+    let mut pruned = false;
+    for wt in selected {
+        let removed_ok = if wt.prunable {
+            let err = if pruned {
+                None
+            } else {
+                pruned = true;
+                let out = Command::new("git").args(["worktree", "prune"]).output();
+                match out {
+                    Ok(o) if o.status.success() => None,
+                    Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                    Err(e) => Some(e.to_string()),
+                }
+            };
+            let ok = err.is_none();
+            results.push((format!("worktree {} (pruned)", wt.path), err));
+            ok
+        } else {
+            let (label, err) = remove_worktree_path(&wt.path);
+            let ok = err.is_none();
+            results.push((label, err));
+            ok
+        };
+        if !removed_ok {
+            continue;
+        }
+        // Delete the freed branch only when it is itself a candidate.
+        if let (Some(branch), Some(_)) = (&wt.branch, wt.category) {
+            match delete_one(repo, branch) {
+                Ok(()) => results.push((format!("branch {branch}"), None)),
+                Err(e) => {
+                    results.push((format!("branch {branch}"), Some(e.message().to_string())))
+                }
+            }
+        }
+    }
+    results
 }

@@ -49,6 +49,16 @@ pub struct Args {
     )]
     pub delete: Vec<String>,
 
+    /// Remove the named worktrees (git worktree remove; refuses dirty or
+    /// locked ones) and exit; combines with --delete
+    #[arg(
+        long,
+        value_name = "PATH",
+        num_args = 1..,
+        conflicts_with_all = ["list", "json", "force", "yes"]
+    )]
+    pub remove_worktree: Vec<String>,
+
     /// Don't run `git fetch --prune` before scanning
     #[arg(long)]
     pub no_fetch: bool,
