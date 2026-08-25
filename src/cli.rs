@@ -28,6 +28,10 @@ pub struct Args {
     #[arg(long, value_name = "DAYS", default_value_t = 90)]
     pub abandoned_days: u32,
 
+    /// Max main-history commits (newest first) scanned for squash matches; 0 = no cap
+    #[arg(long, value_name = "COMMITS", default_value_t = 10_000)]
+    pub squash_scan_limit: u32,
+
     /// Read-only scan: print candidates and exit 0, never prompt or delete
     #[arg(long, conflicts_with_all = ["force", "yes"])]
     pub list: bool,

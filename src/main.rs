@@ -89,6 +89,7 @@ fn run() -> Result<ExitCode> {
         gone: !args.no_gone,
         abandoned: args.abandoned,
         abandoned_days: args.abandoned_days,
+        squash_scan_limit: args.squash_scan_limit,
     };
 
     if !filter.merged && !filter.squashed && !filter.gone && !filter.abandoned {
