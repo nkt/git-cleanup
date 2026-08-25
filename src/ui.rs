@@ -1,4 +1,4 @@
-use crate::git::{Candidate, Category, WorktreeCandidate};
+use crate::git::{Candidate, Category, Kept, WorktreeCandidate};
 use anyhow::Result;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect};
 use owo_colors::OwoColorize;
@@ -7,6 +7,7 @@ use std::io::IsTerminal;
 pub fn print_summary(
     candidates: &[Candidate],
     worktrees: &[WorktreeCandidate],
+    kept: Option<&[Kept]>,
     main: &str,
     read_only: bool,
 ) {
@@ -22,6 +23,7 @@ pub fn print_summary(
     }
 
     if candidates.is_empty() && worktrees.is_empty() {
+        print_kept_section(kept);
         println!("  {}", "nothing to clean up.".green());
         return;
     }
@@ -75,6 +77,8 @@ pub fn print_summary(
         println!();
     }
 
+    print_kept_section(kept);
+
     let mut parts: Vec<String> = Vec::new();
     if !candidates.is_empty() {
         parts.push(format!(
@@ -91,6 +95,18 @@ pub fn print_summary(
         ));
     }
     println!("{} {}", parts.join(" and ").bold(), "found.".dimmed());
+}
+
+fn print_kept_section(kept: Option<&[Kept]>) {
+    let Some(kept) = kept else { return };
+    if kept.is_empty() {
+        return;
+    }
+    println!("  {}", format!("kept ({})", kept.len()).dimmed());
+    for k in kept {
+        println!("    {} {}  {}", "•".dimmed(), k.name, k.reason.dimmed());
+    }
+    println!();
 }
 
 pub fn print_json(candidates: &[Candidate], worktrees: &[WorktreeCandidate], main: &str) {

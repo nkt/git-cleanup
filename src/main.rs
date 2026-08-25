@@ -45,6 +45,8 @@ fn run() -> Result<ExitCode> {
     let repo = git::open()?;
     dbg_log!("repo discovered at {:?} ({:?})", repo.path(), t.elapsed());
 
+    let protected = git::protected_set(&repo, &args.protect);
+
     if !args.delete.is_empty() || !args.remove_worktree.is_empty() {
         let mut results: Vec<(String, Option<String>)> = Vec::new();
         // Worktrees first: a branch checked out in a removed worktree
@@ -57,7 +59,7 @@ fn run() -> Result<ExitCode> {
                 git::detect_main(&repo, &args.remote, args.main.as_deref())?;
             let mut to_delete: Vec<String> = Vec::new();
             for name in &args.delete {
-                if name == &main_name || git::PROTECTED.contains(&name.as_str()) {
+                if name == &main_name || protected.contains(name.as_str()) {
                     results.push((name.clone(), Some("protected branch".into())));
                 } else {
                     to_delete.push(name.clone());
@@ -106,7 +108,8 @@ fn run() -> Result<ExitCode> {
     }
 
     let t = Instant::now();
-    let candidates = git::categorize(&repo, &main_name, &args.remote, filter)?;
+    let scan = git::categorize(&repo, &main_name, &args.remote, filter, &protected)?;
+    let candidates = scan.candidates;
     dbg_log!(
         "categorize produced {} candidate(s) in {:?}",
         candidates.len(),
@@ -119,7 +122,8 @@ fn run() -> Result<ExitCode> {
         ui::print_json(&candidates, &worktree_cands, &main_name);
         return Ok(ExitCode::SUCCESS);
     }
-    ui::print_summary(&candidates, &worktree_cands, &main_name, read_only);
+    let kept = args.verbose.then_some(scan.kept.as_slice());
+    ui::print_summary(&candidates, &worktree_cands, kept, &main_name, read_only);
     if read_only || (candidates.is_empty() && worktree_cands.is_empty()) {
         return Ok(ExitCode::SUCCESS);
     }

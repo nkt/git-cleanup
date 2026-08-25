@@ -75,11 +75,16 @@ pub struct Args {
     #[arg(long, value_name = "BRANCH")]
     pub main: Option<String>,
 
+    /// Additional protected branches (repeatable; also read from
+    /// `git config cleanup.protect`, comma-separated values allowed)
+    #[arg(long, value_name = "BRANCH")]
+    pub protect: Vec<String>,
+
     /// Remote name for fetch and gone detection
     #[arg(long, value_name = "NAME", default_value = "origin")]
     pub remote: String,
 
-    /// Per-branch reasoning
+    /// Also list branches that were kept, with the reason
     #[arg(short, long)]
     pub verbose: bool,
 

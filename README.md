@@ -44,12 +44,19 @@ prompt for which to delete.
 | `-f`, `--force` | delete every candidate without prompting |
 | `-y`, `--yes` | accept the full list (skip the picker, still confirms) |
 | `--main <BRANCH>` | override main-branch detection |
+| `--protect <BRANCH>` | additional protected branches (repeatable) |
 | `--remote <NAME>` | remote to fetch from (default `origin`) |
-| `-v`, `--verbose` | per-branch reasoning |
+| `-v`, `--verbose` | also list kept branches with the reason |
 | `--debug` | structured timing + diagnostic logs on stderr |
 
 The currently checked-out branch, the resolved main branch, and
-`main`/`master`/`develop`/`trunk` are always protected.
+`main`/`master`/`develop`/`trunk` are always protected. Add your own
+with `--protect` or persistently via git config (multi-valued and
+comma-separated both work):
+
+```sh
+git config cleanup.protect "release, staging"
+```
 
 ## Worktrees
 

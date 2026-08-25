@@ -61,6 +61,48 @@ pub struct Candidate {
 /// Branch names that are never offered for deletion.
 pub const PROTECTED: [&str; 5] = ["main", "master", "develop", "trunk", "HEAD"];
 
+/// The built-in protected names plus `git config cleanup.protect`
+/// entries (multi-valued and comma-separated both work) and any
+/// explicit extras from the command line.
+pub fn protected_set(repo: &Repository, extra: &[String]) -> HashSet<String> {
+    let mut set: HashSet<String> = PROTECTED.iter().map(|s| s.to_string()).collect();
+    if let Ok(config) = repo.config() {
+        if let Ok(entries) = config.multivar("cleanup.protect", None) {
+            entries
+                .for_each(|entry| {
+                    if let Some(value) = entry.value() {
+                        for name in value.split(',') {
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                set.insert(name.to_string());
+                            }
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+    for name in extra {
+        let name = name.trim();
+        if !name.is_empty() {
+            set.insert(name.to_string());
+        }
+    }
+    set
+}
+
+/// A branch that was scanned but not offered for deletion.
+#[derive(Debug, Clone)]
+pub struct Kept {
+    pub name: String,
+    pub reason: String,
+}
+
+pub struct Scan {
+    pub candidates: Vec<Candidate>,
+    pub kept: Vec<Kept>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Filter {
     pub merged: bool,
@@ -139,7 +181,8 @@ pub fn categorize(
     main_name: &str,
     remote: &str,
     filter: Filter,
-) -> Result<Vec<Candidate>> {
+    protected: &HashSet<String>,
+) -> Result<Scan> {
     let main_branch = repo.find_branch(main_name, BranchType::Local)?;
     let main_oid = main_branch
         .get()
@@ -147,7 +190,6 @@ pub fn categorize(
         .ok_or_else(|| anyhow!("main branch '{main_name}' has no target"))?;
 
     let current = current_branch(repo)?;
-    let protected: HashSet<&str> = PROTECTED.into_iter().collect();
     let worktrees = list_worktree_branches();
 
     dbg_log!("categorize: main={} main_oid={}", main_name, short_oid(main_oid));
@@ -180,7 +222,7 @@ pub fn categorize(
         if name == main_name {
             continue;
         }
-        if protected.contains(name.as_str()) {
+        if protected.contains(&name) {
             dbg_log!("branch {name}: skip (protected)");
             continue;
         }
@@ -247,6 +289,7 @@ pub fn categorize(
 
     // Phase 3: abandoned + candidate assembly.
     let mut candidates = Vec::new();
+    let mut kept = Vec::new();
     for info in infos {
         let mut category = info.category;
 
@@ -267,7 +310,21 @@ pub fn categorize(
         }
 
         let Some((cat, mut detail)) = category else {
-            dbg_log!("branch {}: kept (no category)", info.name);
+            let upstream = match info.upstream {
+                UpstreamState::Tracked => "upstream tracked",
+                UpstreamState::Gone => "upstream gone",
+                UpstreamState::None => "no upstream",
+            };
+            let reason = format!(
+                "not merged or squashed, {upstream}, last commit {} day{} ago",
+                info.age_days,
+                if info.age_days == 1 { "" } else { "s" }
+            );
+            dbg_log!("branch {}: kept ({reason})", info.name);
+            kept.push(Kept {
+                name: info.name,
+                reason,
+            });
             continue;
         };
 
@@ -305,8 +362,12 @@ pub fn categorize(
         });
     }
 
-    dbg_log!("categorize: {} candidate(s)", candidates.len());
-    Ok(candidates)
+    dbg_log!(
+        "categorize: {} candidate(s), {} kept",
+        candidates.len(),
+        kept.len()
+    );
+    Ok(Scan { candidates, kept })
 }
 
 struct BranchInfo {
