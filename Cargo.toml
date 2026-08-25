@@ -1,8 +1,8 @@
 [package]
 name = "git-cleanup"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Prune merged, squashed, and gone branches from a git repository"
+description = "Prune merged, squashed, and gone branches — and stale worktrees — from a git repository"
 license = "MIT"
 repository = "https://github.com/nkt/git-cleanup"
 
