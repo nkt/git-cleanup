@@ -28,27 +28,35 @@ pub fn print_summary(
         return;
     }
 
+    print_groups(candidates, worktrees, kept);
+    println!(
+        "{} {}",
+        found_line(candidates.len(), worktrees.len()).bold(),
+        "found.".dimmed()
+    );
+}
+
+/// Header line for one repository in a recursive scan.
+pub fn print_repo_header(display: &str, main: &str) {
+    println!("{} {}", display.bold(), format!("(main: {main})").dimmed());
+}
+
+/// Candidate groups, worktrees and (optionally) kept branches.
+pub fn print_groups(
+    candidates: &[Candidate],
+    worktrees: &[WorktreeCandidate],
+    kept: Option<&[Kept]>,
+) {
     let name_width = candidates.iter().map(|c| c.name.len()).max().unwrap_or(0);
 
-    for cat in [
-        Category::Merged,
-        Category::Squashed,
-        Category::Gone,
-        Category::Abandoned,
-    ] {
+    for cat in Category::ALL {
         let group: Vec<&Candidate> =
             candidates.iter().filter(|c| c.category == cat).collect();
         if group.is_empty() {
             continue;
         }
         let header = format!("{} ({})", cat.label(), group.len());
-        let colored_header = match cat {
-            Category::Merged => header.green().to_string(),
-            Category::Squashed => header.yellow().to_string(),
-            Category::Gone => header.red().to_string(),
-            Category::Abandoned => header.magenta().to_string(),
-        };
-        println!("  {colored_header}");
+        println!("  {}", color_category(cat, &header));
         for c in group {
             let detail = match &c.worktree {
                 Some(path) => format!("{} — in worktree {path}", c.detail),
@@ -78,23 +86,35 @@ pub fn print_summary(
     }
 
     print_kept_section(kept);
+}
 
+fn color_category(cat: Category, s: &str) -> String {
+    match cat {
+        Category::Merged => s.green().to_string(),
+        Category::Squashed => s.yellow().to_string(),
+        Category::Contained => s.yellow().to_string(),
+        Category::Superseded => s.bright_yellow().to_string(),
+        Category::Gone => s.red().to_string(),
+        Category::Abandoned => s.magenta().to_string(),
+    }
+}
+
+/// "3 stale branches and 2 stale worktrees".
+pub fn found_line(branches: usize, worktrees: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if !candidates.is_empty() {
+    if branches > 0 {
         parts.push(format!(
-            "{} stale {}",
-            candidates.len(),
-            if candidates.len() == 1 { "branch" } else { "branches" }
+            "{branches} stale {}",
+            if branches == 1 { "branch" } else { "branches" }
         ));
     }
-    if !worktrees.is_empty() {
+    if worktrees > 0 {
         parts.push(format!(
-            "{} stale {}",
-            worktrees.len(),
-            if worktrees.len() == 1 { "worktree" } else { "worktrees" }
+            "{worktrees} stale {}",
+            if worktrees == 1 { "worktree" } else { "worktrees" }
         ));
     }
-    println!("{} {}", parts.join(" and ").bold(), "found.".dimmed());
+    parts.join(" and ")
 }
 
 fn print_kept_section(kept: Option<&[Kept]>) {
@@ -109,8 +129,8 @@ fn print_kept_section(kept: Option<&[Kept]>) {
     println!();
 }
 
-pub fn print_json(candidates: &[Candidate], worktrees: &[WorktreeCandidate], main: &str) {
-    let arr: Vec<serde_json::Value> = candidates
+pub fn candidates_json(candidates: &[Candidate]) -> Vec<serde_json::Value> {
+    candidates
         .iter()
         .map(|c| {
             serde_json::json!({
@@ -124,63 +144,64 @@ pub fn print_json(candidates: &[Candidate], worktrees: &[WorktreeCandidate], mai
                 "worktree": c.worktree,
             })
         })
-        .collect();
-    let wt_arr: Vec<serde_json::Value> = worktrees
+        .collect()
+}
+
+pub fn worktrees_json(worktrees: &[WorktreeCandidate]) -> Vec<serde_json::Value> {
+    worktrees
         .iter()
         .map(|wt| {
             serde_json::json!({
                 "path": wt.path,
                 "branch": wt.branch,
+                "head": wt.head.map(|h| h.to_string()),
                 "category": wt.category.map(|c| c.label()),
                 "detail": wt.detail,
                 "prunable": wt.prunable,
                 "blocked": wt.blocked,
             })
         })
-        .collect();
+        .collect()
+}
+
+pub fn print_json(candidates: &[Candidate], worktrees: &[WorktreeCandidate], main: &str) {
     let out = serde_json::json!({
         "main": main,
-        "candidates": arr,
-        "worktrees": wt_arr,
+        "candidates": candidates_json(candidates),
+        "worktrees": worktrees_json(worktrees),
     });
     println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
 }
 
 pub fn select(candidates: &[&Candidate]) -> Result<Vec<usize>> {
-    let theme = ColorfulTheme::default();
     let items: Vec<String> = candidates
         .iter()
         .map(|c| format!("[{}] {} — {}", c.category.label(), c.name, c.detail))
         .collect();
-    let defaults: Vec<bool> = vec![true; candidates.len()];
-
-    let chosen = MultiSelect::with_theme(&theme)
-        .with_prompt("Select branches to delete (space toggles, enter confirms)")
-        .items(&items)
-        .defaults(&defaults)
-        .interact()?;
-
-    Ok(chosen)
+    select_labels("Select branches to delete (space toggles, enter confirms)", &items)
 }
 
 pub fn select_worktrees(worktrees: &[&WorktreeCandidate]) -> Result<Vec<usize>> {
-    let theme = ColorfulTheme::default();
     let items: Vec<String> = worktrees
         .iter()
         .map(|wt| format!("{} — {}", wt.path, wt.detail))
         .collect();
-    let defaults: Vec<bool> = vec![true; worktrees.len()];
-
-    let chosen = MultiSelect::with_theme(&theme)
-        .with_prompt("Select worktrees to remove (space toggles, enter confirms)")
-        .items(&items)
-        .defaults(&defaults)
-        .interact()?;
-
-    Ok(chosen)
+    select_labels("Select worktrees to remove (space toggles, enter confirms)", &items)
 }
 
-pub fn confirm_cleanup(branches: usize, worktrees: usize) -> Result<bool> {
+/// Multi-select over prepared labels, everything preselected.
+pub fn select_labels(prompt: &str, items: &[String]) -> Result<Vec<usize>> {
+    let theme = ColorfulTheme::default();
+    let defaults: Vec<bool> = vec![true; items.len()];
+    Ok(MultiSelect::with_theme(&theme)
+        .with_prompt(prompt)
+        .items(items)
+        .defaults(&defaults)
+        .interact()?)
+}
+
+/// `repos` > 1 adds "across N repositories" to the prompt.
+pub fn confirm_cleanup(branches: usize, worktrees: usize, repos: usize) -> Result<bool> {
     let theme = ColorfulTheme::default();
     let mut parts: Vec<String> = Vec::new();
     if branches > 0 {
@@ -196,6 +217,9 @@ pub fn confirm_cleanup(branches: usize, worktrees: usize) -> Result<bool> {
         ));
     }
     let mut prompt = parts.join(" and ");
+    if repos > 1 {
+        prompt.push_str(&format!(" across {repos} repositories"));
+    }
     if let Some(first) = prompt.get_mut(0..1) {
         first.make_ascii_uppercase();
     }

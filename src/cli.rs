@@ -19,6 +19,34 @@ pub struct Args {
     #[arg(long)]
     pub no_gone: bool,
 
+    /// Skip contained detection (merging the branch into main changes nothing)
+    #[arg(long)]
+    pub no_contained: bool,
+
+    /// Also detect superseded branches: squash-merged, then edited on main.
+    /// Heuristic, so opt-in: every file the branch has exists in main, at
+    /// least --superseded-pct of its changed lines are in main, and the tip
+    /// is at least --superseded-days old
+    #[arg(long)]
+    pub superseded: bool,
+
+    /// Minimum share of changed lines found in main for --superseded
+    #[arg(long, value_name = "PCT", default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
+    pub superseded_pct: u8,
+
+    /// Minimum tip age in days for --superseded
+    #[arg(long, value_name = "DAYS", default_value_t = 3)]
+    pub superseded_days: u32,
+
+    /// Scan every git repository under the current directory and clean
+    /// them in one pass (one picker, one confirmation)
+    #[arg(short, long)]
+    pub recursive: bool,
+
+    /// How many directory levels --recursive descends
+    #[arg(long, value_name = "LEVELS", default_value_t = 3)]
+    pub max_depth: usize,
+
     /// Also detect abandoned branches (tip older than --abandoned-days).
     /// Off by default: these may hold unmerged work
     #[arg(long)]
@@ -45,7 +73,7 @@ pub struct Args {
         long,
         value_name = "BRANCH",
         num_args = 1..,
-        conflicts_with_all = ["list", "json", "force", "yes"]
+        conflicts_with_all = ["list", "json", "force", "yes", "recursive"]
     )]
     pub delete: Vec<String>,
 
@@ -55,7 +83,7 @@ pub struct Args {
         long,
         value_name = "PATH",
         num_args = 1..,
-        conflicts_with_all = ["list", "json", "force", "yes"]
+        conflicts_with_all = ["list", "json", "force", "yes", "recursive"]
     )]
     pub remove_worktree: Vec<String>,
 
@@ -72,7 +100,7 @@ pub struct Args {
     pub yes: bool,
 
     /// Override main-branch detection
-    #[arg(long, value_name = "BRANCH")]
+    #[arg(long, value_name = "BRANCH", conflicts_with = "recursive")]
     pub main: Option<String>,
 
     /// Additional protected branches (repeatable; also read from

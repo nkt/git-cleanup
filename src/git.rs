@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use git2::{BranchType, ErrorCode, Oid, Repository};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -11,15 +12,28 @@ use std::time::Instant;
 pub enum Category {
     Merged,
     Squashed,
+    Contained,
+    Superseded,
     Gone,
     Abandoned,
 }
 
 impl Category {
+    pub const ALL: [Category; 6] = [
+        Category::Merged,
+        Category::Squashed,
+        Category::Contained,
+        Category::Superseded,
+        Category::Gone,
+        Category::Abandoned,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Category::Merged => "merged",
             Category::Squashed => "squashed",
+            Category::Contained => "contained",
+            Category::Superseded => "superseded",
             Category::Gone => "gone",
             Category::Abandoned => "abandoned",
         }
@@ -107,10 +121,21 @@ pub struct Scan {
 pub struct Filter {
     pub merged: bool,
     pub squashed: bool,
+    pub contained: bool,
+    pub superseded: Option<SupersededCfg>,
     pub gone: bool,
     pub abandoned: bool,
     pub abandoned_days: u32,
     pub squash_scan_limit: u32,
+}
+
+/// Thresholds for the heuristic `superseded` category.
+#[derive(Debug, Clone, Copy)]
+pub struct SupersededCfg {
+    /// Minimum share (percent) of the branch's changed lines found in main.
+    pub min_pct: u8,
+    /// Minimum age of the tip commit, so live work is never offered.
+    pub min_days: u32,
 }
 
 pub fn open() -> Result<Repository> {
@@ -174,6 +199,81 @@ pub fn fetch_prune(remote: &str) -> Result<()> {
         bail!("`git fetch --prune {remote}` failed");
     }
     Ok(())
+}
+
+/// Quiet `git fetch --prune` in `dir`, for running many repositories in
+/// parallel; the error carries git's stderr.
+pub fn fetch_prune_in(dir: &Path, remote: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["fetch", "--prune", "--quiet", remote])
+        .current_dir(dir)
+        // Never hang the whole run on a credential prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to spawn `git fetch`")?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        bail!(
+            "`git fetch --prune {remote}` failed{}",
+            if msg.is_empty() { String::new() } else { format!(": {msg}") }
+        );
+    }
+    Ok(())
+}
+
+/// Non-bare repositories under `root` (a directory holding a `.git`
+/// directory), at most `max_depth` levels down. A found repository is not
+/// descended into; `.git` files (linked worktrees, submodules) are skipped
+/// since their main repository covers them. Symlinks, hidden directories
+/// and `node_modules` are never followed.
+pub fn discover_repos(root: &Path, max_depth: usize) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<PathBuf>) {
+        match std::fs::symlink_metadata(dir.join(".git")) {
+            Ok(m) if m.is_dir() => {
+                out.push(dir.to_path_buf());
+                return;
+            }
+            Ok(_) => return,
+            Err(_) => {}
+        }
+        if depth >= max_depth {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut subdirs: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                !name.starts_with('.') && name != "node_modules"
+            })
+            .map(|e| e.path())
+            .collect();
+        subdirs.sort();
+        for sub in subdirs {
+            walk(&sub, depth + 1, max_depth, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, max_depth, &mut out);
+    out
+}
+
+/// The ref the content checks compare against: the remote-tracking main
+/// when it exists and contains local main (it is fresh after a fetch,
+/// while local main may lag), otherwise local main.
+fn content_base(repo: &Repository, main_name: &str, remote: &str, main_oid: Oid) -> (String, Oid) {
+    let remote_ref = format!("refs/remotes/{remote}/{main_name}");
+    if let Some(oid) = repo.find_reference(&remote_ref).ok().and_then(|r| r.target()) {
+        if oid == main_oid || repo.graph_descendant_of(oid, main_oid).unwrap_or(false) {
+            return (format!("{remote}/{main_name}"), oid);
+        }
+    }
+    (main_name.to_string(), main_oid)
 }
 
 pub fn categorize(
@@ -278,6 +378,7 @@ pub fn categorize(
             age_days,
             fallback,
             category,
+            content_note: None,
         });
     }
     dbg_log!("phase 1 (merged/gone): {} branches in {:?}", infos.len(), phase_t.elapsed());
@@ -285,6 +386,26 @@ pub fn categorize(
     // Phase 2: squashed detection over whatever is still uncategorized.
     if filter.squashed {
         squashed_phase(repo, main_name, main_oid, &mut infos, filter.squash_scan_limit)?;
+    }
+
+    // Phase 2b: content checks (squash-merged, then edited on main).
+    if filter.contained || filter.superseded.is_some() {
+        let phase_t = Instant::now();
+        let (base_name, base_oid) = content_base(repo, main_name, remote, main_oid);
+        let mut probe = ContentProbe::new(repo, base_name, base_oid)?;
+        for info in infos.iter_mut().filter(|i| i.category.is_none()) {
+            match probe.judge(info.oid, info.age_days, filter) {
+                ContentVerdict::Hit(cat, detail) => {
+                    dbg_log!("branch {}: {} ({detail})", info.name, cat.label());
+                    info.category = Some((cat, detail));
+                }
+                ContentVerdict::Miss(note) => {
+                    dbg_log!("branch {}: content: {note}", info.name);
+                    info.content_note = Some(note);
+                }
+            }
+        }
+        dbg_log!("phase 2b (content): {:?}", phase_t.elapsed());
     }
 
     // Phase 3: abandoned + candidate assembly.
@@ -315,11 +436,14 @@ pub fn categorize(
                 UpstreamState::Gone => "upstream gone",
                 UpstreamState::None => "no upstream",
             };
-            let reason = format!(
+            let mut reason = format!(
                 "not merged or squashed, {upstream}, last commit {} day{} ago",
                 info.age_days,
                 if info.age_days == 1 { "" } else { "s" }
             );
+            if let Some(note) = &info.content_note {
+                reason.push_str(&format!(", {note}"));
+            }
             dbg_log!("branch {}: kept ({reason})", info.name);
             kept.push(Kept {
                 name: info.name,
@@ -331,7 +455,7 @@ pub fn categorize(
         let ahead = match cat {
             Category::Merged => Some(0),
             Category::Squashed => None,
-            Category::Gone | Category::Abandoned => {
+            Category::Contained | Category::Superseded | Category::Gone | Category::Abandoned => {
                 let t = Instant::now();
                 let a = repo
                     .graph_ahead_behind(info.oid, main_oid)
@@ -378,6 +502,275 @@ struct BranchInfo {
     /// Remote/upstream tip to retry the squashed check against.
     fallback: Option<Oid>,
     category: Option<(Category, String)>,
+    /// Why the content checks did not match, for the verbose kept list.
+    content_note: Option<String>,
+}
+
+pub enum ContentVerdict {
+    Hit(Category, String),
+    Miss(String),
+}
+
+/// Lock files are derived from the manifests, so they are left out of the
+/// line counts.
+const DERIVED_FILES: [&str; 7] = [
+    "yarn.lock",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "Cargo.lock",
+    "Podfile.lock",
+    "Gemfile.lock",
+];
+
+/// Shorter lines (braces, `});`, blank-ish) match anywhere and prove nothing.
+const MIN_LINE_LEN: usize = 4;
+
+/// Content checks against one base commit, for branches that were
+/// squash-merged and then edited on main, so neither ancestry nor
+/// patch-id finds them.
+pub struct ContentProbe<'r> {
+    repo: &'r Repository,
+    base_name: String,
+    base_oid: Oid,
+    base_tree: git2::Tree<'r>,
+    /// Trimmed lines of each base file; None when the base lacks it.
+    lines: HashMap<PathBuf, Option<HashSet<String>>>,
+    merge_tree_ok: bool,
+}
+
+#[derive(Default)]
+struct FileChange {
+    added: Vec<String>,
+    removed: Vec<String>,
+    binary: bool,
+    /// Blob at the branch tip; None when the branch deleted the file.
+    tip_blob: Option<Oid>,
+}
+
+struct Coverage {
+    changed: usize,
+    in_base: usize,
+    /// (path, lines not in base), largest first.
+    gaps: Vec<(String, usize)>,
+    /// Files the branch has that the base lacks.
+    absent: Vec<String>,
+}
+
+impl<'r> ContentProbe<'r> {
+    pub fn new(repo: &'r Repository, base_name: String, base_oid: Oid) -> Result<Self> {
+        let base_tree = repo.find_commit(base_oid)?.tree()?;
+        Ok(Self {
+            repo,
+            base_name,
+            base_oid,
+            base_tree,
+            lines: HashMap::new(),
+            merge_tree_ok: true,
+        })
+    }
+
+    pub fn judge(&mut self, tip: Oid, age_days: i64, filter: Filter) -> ContentVerdict {
+        if filter.merged
+            && (tip == self.base_oid
+                || self.repo.graph_descendant_of(self.base_oid, tip).unwrap_or(false))
+        {
+            return ContentVerdict::Hit(
+                Category::Merged,
+                format!("merged into {}", self.base_name),
+            );
+        }
+        if filter.contained && self.contained(tip) == Some(true) {
+            return ContentVerdict::Hit(
+                Category::Contained,
+                format!("every change already in {}", self.base_name),
+            );
+        }
+        let Some(cfg) = filter.superseded else {
+            return ContentVerdict::Miss(format!("changes not all in {}", self.base_name));
+        };
+        let cov = match self.coverage(tip) {
+            Ok(c) => c,
+            Err(e) => return ContentVerdict::Miss(format!("content check failed: {e}")),
+        };
+        let pct = (cov.in_base * 100).checked_div(cov.changed).unwrap_or(100);
+        let summary = self.describe(&cov, pct);
+        if !cov.absent.is_empty() {
+            return ContentVerdict::Miss(summary);
+        }
+        if pct < usize::from(cfg.min_pct) {
+            return ContentVerdict::Miss(summary);
+        }
+        if age_days < i64::from(cfg.min_days) {
+            return ContentVerdict::Miss(format!("{summary}, but younger than {} days", cfg.min_days));
+        }
+        ContentVerdict::Hit(Category::Superseded, summary)
+    }
+
+    fn describe(&self, cov: &Coverage, pct: usize) -> String {
+        let missing = cov.changed - cov.in_base;
+        let mut s = format!(
+            "{pct}% of {} changed lines in {}",
+            cov.changed, self.base_name
+        );
+        if !cov.absent.is_empty() {
+            let shown: Vec<&str> = cov.absent.iter().take(3).map(String::as_str).collect();
+            s.push_str(&format!(
+                ", {} file{} not in {}: {}{}",
+                cov.absent.len(),
+                if cov.absent.len() == 1 { "" } else { "s" },
+                self.base_name,
+                shown.join(", "),
+                if cov.absent.len() > 3 { ", …" } else { "" }
+            ));
+        } else if missing > 0 {
+            let shown: Vec<String> = cov
+                .gaps
+                .iter()
+                .take(2)
+                .map(|(f, n)| format!("{f} {n}"))
+                .collect();
+            s.push_str(&format!(
+                ", {missing} differ (most in {}{})",
+                shown.join(", "),
+                if cov.gaps.len() > 2 { ", …" } else { "" }
+            ));
+        }
+        s
+    }
+
+    /// True when merging the tip into the base changes nothing: the merge
+    /// result is the base tree. None when `git merge-tree --write-tree`
+    /// (git 2.38+) is unavailable.
+    fn contained(&mut self, tip: Oid) -> Option<bool> {
+        if !self.merge_tree_ok {
+            return None;
+        }
+        let out = Command::new("git")
+            .args(["merge-tree", "--write-tree", &self.base_oid.to_string(), &tip.to_string()])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        match out.status.code() {
+            Some(0) => {
+                let tree = String::from_utf8_lossy(&out.stdout);
+                let tree = tree.lines().next().unwrap_or("").trim();
+                Some(tree == self.base_tree.id().to_string())
+            }
+            Some(1) => Some(false), // conflicts
+            _ => {
+                dbg_log!("git merge-tree --write-tree unavailable; contained check off");
+                self.merge_tree_ok = false;
+                None
+            }
+        }
+    }
+
+    /// How much of merge-base..tip the base already has: an added line
+    /// counts when the base's version of the file contains it, a removed
+    /// line when the base's version no longer does.
+    fn coverage(&mut self, tip: Oid) -> Result<Coverage> {
+        let repo = self.repo;
+        let mb = repo.merge_base(self.base_oid, tip)?;
+        let from = repo.find_commit(mb)?.tree()?;
+        let to = repo.find_commit(tip)?.tree()?;
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(0);
+        let diff = repo.diff_tree_to_tree(Some(&from), Some(&to), Some(&mut opts))?;
+
+        let mut files: HashMap<PathBuf, FileChange> = HashMap::new();
+        diff.print(git2::DiffFormat::Patch, |delta, _hunk, line| {
+            let deleted = delta.status() == git2::Delta::Deleted;
+            let file = if deleted { delta.old_file() } else { delta.new_file() };
+            let Some(path) = file.path() else { return true };
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| DERIVED_FILES.contains(&n))
+            {
+                return true;
+            }
+            let entry = files.entry(path.to_path_buf()).or_insert_with(|| FileChange {
+                tip_blob: (!deleted).then(|| delta.new_file().id()),
+                ..Default::default()
+            });
+            let text = || String::from_utf8_lossy(line.content()).trim().to_string();
+            match line.origin_value() {
+                git2::DiffLineType::Addition => {
+                    let t = text();
+                    if t.len() >= MIN_LINE_LEN {
+                        entry.added.push(t);
+                    }
+                }
+                git2::DiffLineType::Deletion => {
+                    let t = text();
+                    if t.len() >= MIN_LINE_LEN {
+                        entry.removed.push(t);
+                    }
+                }
+                git2::DiffLineType::Binary => entry.binary = true,
+                _ => {}
+            }
+            true
+        })?;
+
+        let mut cov = Coverage { changed: 0, in_base: 0, gaps: Vec::new(), absent: Vec::new() };
+        for (path, fc) in files {
+            let display = path.to_string_lossy().to_string();
+            let base_blob = self.base_tree.get_path(&path).ok().map(|e| e.id());
+            let weight = (fc.added.len() + fc.removed.len()).max(usize::from(fc.binary));
+            if weight == 0 {
+                continue;
+            }
+            cov.changed += weight;
+            // Same final content, or deleted on both sides: fully in base.
+            if fc.tip_blob == base_blob {
+                cov.in_base += weight;
+                continue;
+            }
+            if fc.tip_blob.is_some() && base_blob.is_none() {
+                cov.absent.push(display.clone());
+                cov.gaps.push((display, weight));
+                continue;
+            }
+            if fc.binary {
+                cov.gaps.push((display, weight));
+                continue;
+            }
+            let base_lines = self.base_lines(&path, base_blob);
+            let hits = match base_lines {
+                Some(set) => {
+                    fc.added.iter().filter(|l| set.contains(*l)).count()
+                        + fc.removed.iter().filter(|l| !set.contains(*l)).count()
+                }
+                // Base deleted the file too: the branch's removals are in.
+                None => fc.removed.len(),
+            };
+            cov.in_base += hits;
+            if hits < weight {
+                cov.gaps.push((display, weight - hits));
+            }
+        }
+        cov.gaps.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        cov.absent.sort();
+        Ok(cov)
+    }
+
+    fn base_lines(&mut self, path: &Path, blob: Option<Oid>) -> Option<&HashSet<String>> {
+        let repo = self.repo;
+        self.lines
+            .entry(path.to_path_buf())
+            .or_insert_with(|| {
+                let blob = repo.find_blob(blob?).ok()?;
+                Some(
+                    String::from_utf8_lossy(blob.content())
+                        .lines()
+                        .map(|l| l.trim().to_string())
+                        .collect(),
+                )
+            })
+            .as_ref()
+    }
 }
 
 /// One `git branch --merged` call replaces a per-branch ancestry check;
@@ -792,11 +1185,12 @@ pub fn delete_branches(
             continue;
         }
 
+        let tip = branch_tip(repo, name);
         let outcome = delete_one(repo, name);
         match outcome {
             Ok(()) => {
                 dbg_log!("  ok ({:?})", t.elapsed());
-                results.push((name.clone(), None));
+                results.push((with_tip(name, tip), None));
             }
             Err(e) => {
                 dbg_log!(
@@ -819,6 +1213,18 @@ pub fn delete_branches(
     results
 }
 
+fn branch_tip(repo: &Repository, name: &str) -> Option<Oid> {
+    repo.find_branch(name, BranchType::Local).ok()?.get().target()
+}
+
+/// Deletion label with the tip, so `git branch <name> <sha>` can undo it.
+fn with_tip(label: &str, tip: Option<Oid>) -> String {
+    match tip {
+        Some(oid) => format!("{label} (was {})", short_oid(oid)),
+        None => label.to_string(),
+    }
+}
+
 fn delete_one(repo: &Repository, name: &str) -> std::result::Result<(), git2::Error> {
     let mut b = repo.find_branch(name, BranchType::Local)?;
     b.delete()?;
@@ -829,6 +1235,7 @@ fn delete_one(repo: &Repository, name: &str) -> std::result::Result<(), git2::Er
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: Option<String>,
+    pub head: Option<Oid>,
     pub locked: bool,
     pub prunable: bool,
     pub is_main: bool,
@@ -853,12 +1260,15 @@ fn list_worktrees() -> Vec<WorktreeInfo> {
             cur = Some(WorktreeInfo {
                 path: p.to_string(),
                 branch: None,
+                head: None,
                 locked: false,
                 prunable: false,
                 is_main: result.is_empty(),
             });
         } else if let Some(wt) = cur.as_mut() {
-            if let Some(b) = line.strip_prefix("branch ") {
+            if let Some(h) = line.strip_prefix("HEAD ") {
+                wt.head = Oid::from_str(h).ok();
+            } else if let Some(b) = line.strip_prefix("branch ") {
                 wt.branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
             } else if line == "locked" || line.starts_with("locked ") {
                 wt.locked = true;
@@ -891,20 +1301,87 @@ pub struct WorktreeCandidate {
     /// Reason this worktree is listed but not removable (dirty, locked, ...).
     pub blocked: Option<String>,
     pub prunable: bool,
+    /// Checked-out commit, printed on removal so it can be recovered.
+    pub head: Option<Oid>,
 }
 
-/// Find stale worktrees: prunable ones plus worktrees whose checked-out
-/// branch is itself a deletion candidate.
-pub fn scan_worktrees(candidates: &[Candidate]) -> Vec<WorktreeCandidate> {
+/// What `scan_worktrees` needs beyond the branch candidates.
+pub struct WorktreeScanCtx<'a> {
+    /// Directory git-cleanup was launched from; a worktree containing it
+    /// is never removed.
+    pub launch_dir: Option<&'a Path>,
+    pub main_name: &'a str,
+    pub remote: &'a str,
+    pub filter: Filter,
+}
+
+/// Find stale worktrees: prunable ones, worktrees whose checked-out
+/// branch is itself a deletion candidate, and detached worktrees whose
+/// HEAD is merged into main or whose content main already has.
+pub fn scan_worktrees(
+    repo: &Repository,
+    candidates: &[Candidate],
+    ctx: &WorktreeScanCtx<'_>,
+) -> Vec<WorktreeCandidate> {
     let by_branch: HashMap<&str, &Candidate> =
         candidates.iter().map(|c| (c.name.as_str(), c)).collect();
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.canonicalize().ok());
+    let cwd = ctx.launch_dir.and_then(|p| p.canonicalize().ok());
+    let blocked_reason = |wt: &WorktreeInfo| -> Option<String> {
+        if wt.locked {
+            Some("locked".to_string())
+        } else if cwd
+            .as_ref()
+            .zip(Path::new(&wt.path).canonicalize().ok())
+            .is_some_and(|(c, w)| c.starts_with(w))
+        {
+            Some("current directory".to_string())
+        } else if worktree_is_dirty(&wt.path) {
+            Some("uncommitted changes".to_string())
+        } else {
+            None
+        }
+    };
+    let mut probe: Option<ContentProbe<'_>> = None;
 
     let mut result = Vec::new();
     for wt in list_worktrees() {
         if wt.is_main {
+            continue;
+        }
+
+        if wt.branch.is_none() && !wt.prunable {
+            let Some(head) = wt.head else { continue };
+            if probe.is_none() {
+                let main_oid = repo
+                    .find_branch(ctx.main_name, BranchType::Local)
+                    .ok()
+                    .and_then(|b| b.get().target());
+                if let Some(main_oid) = main_oid {
+                    let (name, oid) = content_base(repo, ctx.main_name, ctx.remote, main_oid);
+                    probe = ContentProbe::new(repo, name, oid).ok();
+                }
+            }
+            let Some(p) = probe.as_mut() else { continue };
+            let age = commit_age_days(repo, head).unwrap_or(0);
+            let detail_head = format!("detached at {}", short_oid(head));
+            match p.judge(head, age, ctx.filter) {
+                ContentVerdict::Hit(cat, detail) => {
+                    let blocked = blocked_reason(&wt);
+                    dbg_log!("worktree {}: detached, {} (blocked: {blocked:?})", wt.path, cat.label());
+                    result.push(WorktreeCandidate {
+                        path: wt.path,
+                        branch: None,
+                        category: Some(cat),
+                        detail: format!("{detail_head}: {detail}"),
+                        blocked,
+                        prunable: false,
+                        head: Some(head),
+                    });
+                }
+                ContentVerdict::Miss(note) => {
+                    dbg_log!("worktree {}: {detail_head}, kept ({note})", wt.path);
+                }
+            }
             continue;
         }
 
@@ -924,6 +1401,7 @@ pub fn scan_worktrees(candidates: &[Candidate]) -> Vec<WorktreeCandidate> {
                 detail: "prunable (directory is gone)".to_string(),
                 blocked: wt.locked.then(|| "locked".to_string()),
                 prunable: true,
+                head: wt.head,
             });
             continue;
         }
@@ -933,19 +1411,7 @@ pub fn scan_worktrees(candidates: &[Candidate]) -> Vec<WorktreeCandidate> {
             continue;
         };
 
-        let blocked = if wt.locked {
-            Some("locked".to_string())
-        } else if cwd
-            .as_ref()
-            .zip(std::path::Path::new(&wt.path).canonicalize().ok())
-            .is_some_and(|(c, w)| c.starts_with(w))
-        {
-            Some("current directory".to_string())
-        } else if worktree_is_dirty(&wt.path) {
-            Some("uncommitted changes".to_string())
-        } else {
-            None
-        };
+        let blocked = blocked_reason(&wt);
         dbg_log!(
             "worktree {}: branch {} is {} (blocked: {:?})",
             wt.path,
@@ -960,6 +1426,7 @@ pub fn scan_worktrees(candidates: &[Candidate]) -> Vec<WorktreeCandidate> {
             detail: format!("branch {}: {}", cand.name, cand.detail),
             blocked,
             prunable: false,
+            head: wt.head,
         });
     }
     result
@@ -1021,6 +1488,7 @@ pub fn remove_worktrees(
         } else {
             let (label, err) = remove_worktree_path(&wt.path);
             let ok = err.is_none();
+            let label = if ok && wt.branch.is_none() { with_tip(&label, wt.head) } else { label };
             results.push((label, err));
             ok
         };
@@ -1029,8 +1497,9 @@ pub fn remove_worktrees(
         }
         // Delete the freed branch only when it is itself a candidate.
         if let (Some(branch), Some(_)) = (&wt.branch, wt.category) {
+            let tip = branch_tip(repo, branch);
             match delete_one(repo, branch) {
-                Ok(()) => results.push((format!("branch {branch}"), None)),
+                Ok(()) => results.push((with_tip(&format!("branch {branch}"), tip), None)),
                 Err(e) => {
                     results.push((format!("branch {branch}"), Some(e.message().to_string())))
                 }
